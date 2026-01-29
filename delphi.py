@@ -17,6 +17,11 @@ from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
 from datetime import datetime, timedelta
+import threading
+from alpaca.data.live import StockDataStream
+import asyncio
+
+
 
 
 # Load env
@@ -36,13 +41,12 @@ data_client = StockHistoricalDataClient(
 )
 
 # Live data stream
-stream = TradingStream(
+
+stream = StockDataStream(
     api_key=os.getenv("APCA_API_KEY_ID"),
-    secret_key=os.getenv("APCA_API_SECRET_KEY"),
-    paper=True
+    secret_key=os.getenv("APCA_API_SECRET_KEY")
 )
 
-ALPACA_STREAM_URL = "wss://stream.data.alpaca.markets/v2/iex"
 
 class Bot():
 
@@ -56,62 +60,52 @@ class Bot():
         self.price_last = None
         self.shares_held = False
 
-
-    def on_trade_update(self, trade):
-        global price_last, shares_held
-
-        
-        symbol = "AAPL"
-        qty = 1
-
-        # buy/sell Order
-
-        Stock_buy = MarketOrderRequest(
-            symbol,
-            qty,
-            side=OrderSide.BUY,
-            time_in_force=TimeInForce.DAY 
-        )
-
-        Stock_sell = MarketOrderRequest(
-            symbol,
-            qty,
-            side=OrderSide.SELL,
-            time_in_force=TimeInForce.DAY 
-        )
-
+    async def on_trade_update(self, trade):
         price_current = trade.price
 
-        if price_last is None:
-            price_last = price_current
+        if self.price_last is None:
+            self.price_last = price_current
             return
 
-        current_price_momentum = price_current - price_last
-        price_last = price_current
+        current_price_momentum = price_current - self.price_last
+        self.price_last = price_current
 
-        avg_price_momentum = self.get_avg_price_momentum("AAPL", 5)
-        # algorithm logic
+        avg_price_momentum = await asyncio.to_thread(
+            self.get_avg_price_momentum,
+            self.symbol,
+            5
+        )
 
         if avg_price_momentum is None:
-            print("not enough historical data")
+            return
 
-        if (avg_price_momentum > 0):
-            if (current_price_momentum > 2 and shares_held == False):
+        if avg_price_momentum > 0:
 
-                order = client.submit_order(Stock_buy)
-                print("Buy order sent:", order)
+            if current_price_momentum > 0.05 and not self.shares_held:
+                await asyncio.to_thread(
+                    self.client.submit_order,
+                    MarketOrderRequest(
+                        symbol=self.symbol,
+                        qty=self.qty,
+                        side=OrderSide.BUY,
+                        time_in_force=TimeInForce.DAY
+                    )
+                )
+                self.shares_held = True
+                print("BUY")
 
-                shares_held = True
-
-            elif (current_price_momentum < -2 and shares_held == True):
-
-                order = client.submit_order(Stock_sell)
-                print("Buy order sent:", order)
-
-                shares_held = False 
-        else:
-
-            print("avg momentum too low")
+            elif current_price_momentum < -0.05 and self.shares_held:
+                await asyncio.to_thread(
+                    self.client.submit_order,
+                    MarketOrderRequest(
+                        symbol=self.symbol,
+                        qty=self.qty,
+                        side=OrderSide.SELL,
+                        time_in_force=TimeInForce.DAY
+                    )
+                )
+                self.shares_held = False
+                print("SELL")
 
     def get_avg_price_momentum(self, symbol, days=5):
         end = datetime.utcnow()
@@ -234,7 +228,7 @@ class AttributeListWidget(ttk.Frame):
                 position.unrealized_pl
             )
 
-        self.after(60_000, self.update_positions)
+        self.after(10_000, self.update_positions)
     
     def insert_row(self, name, amount, pl):
         self.tree.insert(
@@ -280,6 +274,13 @@ class App(tkinter.Tk):
 
         self.list_widget = AttributeListWidget(self)
         self.list_widget.grid(row=1, column=0, sticky="nsew", padx=10, pady=10)
+
+        # Run Bot 
+        bot = Bot(client, data_client)
+
+        stream.subscribe_trades(bot.on_trade_update, "AAPL")
+        threading.Thread(target=stream.run, daemon=True).start()
+
 
         # Optional: make frame borders sleek (modern flat look)
         style = ttk.Style()
