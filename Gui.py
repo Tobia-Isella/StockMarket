@@ -357,8 +357,10 @@ class App(tkinter.Tk):
         self.terminal.grid(row=2, column=0, columnspan=2,
                            sticky="nsew", padx=(10, 5), pady=(0, 10))
 
-        # start live stream
-        stream.subscribe_trades(self.bot.on_trade_update, self.bot.symbol)
+        # start live stream — subscribe to all current top-3 BST symbols
+        # so tick-momentum trading fires for each held position
+        stream.subscribe_trades(self.bot.on_trade_update, *self.bot.get_stream_symbols())
+        print(f"📡 Subscribed to tick streams: {self.bot.get_stream_symbols()}")
         threading.Thread(target=stream.run, daemon=True).start()
 
         # styles

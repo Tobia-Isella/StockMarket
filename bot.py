@@ -39,6 +39,19 @@ WATCHLIST = [
     "META", "TSLA", "AMD",  "INTC", "NFLX",
 ]
 
+# ── position sizing ───────────────────────────────────────────────────────────
+# Sized for a ~$1,000,000 paper account.
+#
+#   BST_QTY  – shares per position, used by both the BST entry and the
+#              tick-momentum strategy for each held symbol.
+#              (~$5-15k each depending on price, 3 positions ≈ 5% of capital)
+BST_QTY = 50
+
+# Minimum seconds between tick-momentum trades on the same symbol.
+# Prevents the bot trading on every tick when 3 streams fire simultaneously.
+# The old single-AAPL bot naturally traded slowly; this restores that pace.
+TRADE_COOLDOWN_SECS = 60
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Binary Search Tree — ordered by avg momentum
@@ -50,9 +63,8 @@ class BSTNode:
         self.momentum = momentum
         self.left:  "BSTNode | None" = None
         self.right: "BSTNode | None" = None
-        # visual layout fields (used by GUI only, harmless here)
-        self._x_idx: int = 0
-        self._depth: int = 0
+        self._x_idx: int = 0   # GUI layout only
+        self._depth: int = 0   # GUI layout only
 
     def __repr__(self):
         return f"BSTNode({self.symbol}, {self.momentum:.3f})"
@@ -69,7 +81,6 @@ class MomentumBST:
     def __init__(self):
         self.root: BSTNode | None = None
 
-    # ── insert (single node) ─────────────────────
     def insert(self, symbol: str, momentum: float) -> None:
         node = BSTNode(symbol, momentum)
         if self.root is None:
@@ -85,9 +96,7 @@ class MomentumBST:
             if cur.right is None: cur.right = new
             else: self._insert(cur.right, new)
 
-    # ── balanced bulk-build ───────────────────────
     def build_balanced(self, items: list[tuple[str, float]]) -> None:
-        """Sort by momentum, then recursively pick the median as root."""
         self.root = self._from_sorted(sorted(items, key=lambda x: x[1]))
 
     def _from_sorted(self, items: list[tuple[str, float]]) -> "BSTNode | None":
@@ -99,7 +108,6 @@ class MomentumBST:
         node.right = self._from_sorted(items[mid + 1:])
         return node
 
-    # ── traversal ────────────────────────────────
     def inorder(self) -> list[tuple[str, float]]:
         result: list[tuple[str, float]] = []
         self._inorder(self.root, result)
@@ -133,28 +141,85 @@ class Bot:
         self.client      = client
         self.data_client = data_client
 
-        # primary AAPL momentum signal state
-        self.symbol       = "AAPL"
-        self.primary_qty  = 10
-        self.price_last:  float | None    = None
-        self.shares_held: bool            = False
+        # self.symbol kept for gui.py stream subscription compatibility
+        self.symbol = "AAPL"
 
-        self.avg_price_momentum:  float | None    = None
-        self.last_momentum_update: datetime | None = None
+        # ── per-symbol tick-momentum state ────────────────────────────────────
+        # One entry per BST-held symbol. Initialised when BST buys a symbol,
+        # cleared when BST sells it.
+        # Each entry is a dict with keys:
+        #   price_last       – last trade price seen on the stream
+        #   avg_momentum     – 5-day average daily momentum (refreshed every 5 min)
+        #   last_mom_update  – datetime of last avg_momentum refresh
+        #   shares_held      – True if a tick position is currently open
+        #   qty              – shares to trade (reset to BST_QTY after each sell)
+        #   sell_pending     – guard flag to prevent duplicate sell orders per tick
+        self.tick_state: dict[str, dict] = {}
 
-        # BST strategy state
-        self.qty          = 1
+        # ── BST strategy state ────────────────────────────────────────────────
+        self.qty          = BST_QTY
         self.momentum_bst = MomentumBST()
         self.bst_rankings: list[tuple[str, float]] = []
-        self.bst_positions: set[str]               = set()
         self.last_bst_build: datetime | None       = None
 
         self.market_is_open: bool | None = None
 
+        # Sync BST positions with actual broker holdings on startup
+        self.bst_positions: set[str] = self._sync_bst_positions()
+        print(f"📋 Startup BST positions: {self.bst_positions}")
+
         print("🌳 Building initial momentum BST …")
         self._build_momentum_bst()
 
-    # ── BST ───────────────────────────────────────
+        # Initialise tick state for top-3 symbols regardless of whether
+        # they are currently held — ensures trades fire even from a cold start.
+        for sym, _ in self.momentum_bst.top_n(3):
+            if sym not in self.tick_state:
+                self._init_tick_state(sym)
+
+    # ── position helpers ──────────────────────────────────────────────────────
+
+    def _get_actual_position(self, symbol: str) -> int:
+        try:
+            pos = self.client.get_open_position(symbol)
+            return int(float(pos.qty))
+        except Exception:
+            return 0
+
+    def _sync_bst_positions(self) -> set[str]:
+        held: set[str] = set()
+        try:
+            positions = self.client.get_all_positions()
+            for pos in positions:
+                if pos.symbol in WATCHLIST:
+                    held.add(pos.symbol)
+        except Exception as e:
+            print(f"⚠️  Could not sync BST positions: {e}")
+        return held
+
+    # ── tick-momentum state management ────────────────────────────────────────
+
+    def _init_tick_state(self, symbol: str) -> None:
+        """Create a fresh tick-state entry for *symbol*."""
+        actual_qty = self._get_actual_position(symbol)
+        self.tick_state[symbol] = {
+            "price_last":      None,
+            "avg_momentum":    None,
+            "last_mom_update": None,
+            "shares_held":     actual_qty > 0,
+            "qty":             actual_qty if actual_qty > 0 else BST_QTY,
+            "sell_pending":    False,
+            "last_trade_time": None,   # cooldown: prevents trades within TRADE_COOLDOWN_SECS
+        }
+        print(f"📋 Tick state initialised for {symbol}: "
+              f"qty={self.tick_state[symbol]['qty']}, "
+              f"shares_held={self.tick_state[symbol]['shares_held']}")
+
+    def _remove_tick_state(self, symbol: str) -> None:
+        self.tick_state.pop(symbol, None)
+
+    # ── BST ───────────────────────────────────────────────────────────────────
+
     def _build_momentum_bst(self) -> None:
         raw: list[tuple[str, float]] = []
         for symbol in WATCHLIST:
@@ -166,8 +231,8 @@ class Bot:
         bst = MomentumBST()
         bst.build_balanced(raw)
 
-        self.momentum_bst  = bst
-        self.bst_rankings  = bst.inorder()
+        self.momentum_bst   = bst
+        self.bst_rankings   = bst.inorder()
         self.last_bst_build = datetime.now(timezone.utc)
         print(f"🏆 Top momentum stocks: {bst.top_n(3)}")
 
@@ -181,18 +246,26 @@ class Bot:
     def _execute_bst_trades(self) -> None:
         top3 = {sym for sym, _ in self.momentum_bst.top_n(3)}
 
+        # Exit positions no longer in top-3
         for symbol in list(self.bst_positions):
             if symbol not in top3:
+                actual = self._get_actual_position(symbol)
+                if actual <= 0:
+                    self.bst_positions.discard(symbol)
+                    self._remove_tick_state(symbol)
+                    continue
                 try:
                     self.client.submit_order(MarketOrderRequest(
-                        symbol=symbol, qty=self.qty,
+                        symbol=symbol, qty=actual,
                         side=OrderSide.SELL, time_in_force=TimeInForce.DAY
                     ))
                     self.bst_positions.discard(symbol)
-                    print(f"🔴 BST EXIT  {symbol}")
+                    self._remove_tick_state(symbol)
+                    print(f"🔴 BST EXIT  {symbol} ({actual} shares)")
                 except Exception as e:
                     print(f"❌ BST sell {symbol} failed: {e}")
 
+        # Enter new top-3 positions
         for symbol in top3:
             if symbol not in self.bst_positions:
                 try:
@@ -201,11 +274,13 @@ class Bot:
                         side=OrderSide.BUY, time_in_force=TimeInForce.DAY
                     ))
                     self.bst_positions.add(symbol)
-                    print(f"🟢 BST ENTER {symbol}")
+                    self._init_tick_state(symbol)
+                    print(f"🟢 BST ENTER {symbol} ({self.qty} shares)")
                 except Exception as e:
                     print(f"❌ BST buy {symbol} failed: {e}")
 
-    # ── live trade handler ────────────────────────
+    # ── live trade handler ────────────────────────────────────────────────────
+
     async def on_trade_update(self, trade) -> None:
         is_open = await asyncio.to_thread(self.check_market_status)
 
@@ -218,63 +293,101 @@ class Bot:
 
         await asyncio.to_thread(self._maybe_rebuild_bst)
 
+        symbol = trade.symbol
+        if symbol not in self.tick_state:
+            return  # not a BST-managed symbol, ignore
+
+        state         = self.tick_state[symbol]
         price_current = trade.price
-        if self.price_last is None:
-            self.price_last = price_current
+
+        # Need at least two ticks to compute momentum
+        if state["price_last"] is None:
+            state["price_last"] = price_current
             return
 
-        current_momentum = price_current - self.price_last
-        self.price_last  = price_current
-        now = datetime.now(timezone.utc)
+        current_momentum    = price_current - state["price_last"]
+        state["price_last"] = price_current
+        now                 = datetime.now(timezone.utc)
 
-        if (self.avg_price_momentum is None
-                or (now - self.last_momentum_update).seconds > 300):
-            await asyncio.to_thread(self.update_avg_momentum)
+        # Refresh 5-day average momentum every 5 minutes
+        if (state["avg_momentum"] is None or state["last_mom_update"] is None
+                or (now - state["last_mom_update"]).seconds > 300):
+            state["avg_momentum"]    = self.get_avg_price_momentum(symbol, 5)
+            state["last_mom_update"] = now
 
-        avg = self.avg_price_momentum
+        avg = state["avg_momentum"]
         if avg is None:
-            print("NO LONG RUN PRICE MOMENTUM")
+            print(f"{symbol}: NO LONG RUN PRICE MOMENTUM")
             return
 
+        # Enforce cooldown — skip if a trade fired too recently for this symbol
+        if state["last_trade_time"] is not None:
+            elapsed = (now - state["last_trade_time"]).total_seconds()
+            if elapsed < TRADE_COOLDOWN_SECS:
+                return
+
+        # Only trade when daily trend isn't deeply negative
         if avg > -10:
-            if current_momentum > 0.05 and not self.shares_held:
-                await asyncio.to_thread(self.cancel_all_orders)
+            if current_momentum > 0.10 and not state["shares_held"]:
+                self._cancel_orders(symbol)
                 try:
-                    await asyncio.to_thread(self.client.submit_order, MarketOrderRequest(
-                        symbol=self.symbol, qty=self.primary_qty,
+                    self.client.submit_order(MarketOrderRequest(
+                        symbol=symbol, qty=state["qty"],
                         side=OrderSide.BUY, time_in_force=TimeInForce.DAY
                     ))
-                    self.shares_held = True
-                    print("✅ BUY order placed")
+                    state["shares_held"]  = True
+                    state["sell_pending"] = False
+                    state["last_trade_time"] = now
+                    print(f"✅ TICK BUY  {symbol} ({state['qty']} shares)")
                 except Exception as e:
-                    print(f"❌ BUY failed: {e}")
+                    print(f"❌ TICK BUY  {symbol} failed: {e}")
 
-            elif current_momentum < -0.05 and self.shares_held:
-                await asyncio.to_thread(self.cancel_all_orders)
+            elif current_momentum < -0.10 and state["shares_held"] and not state["sell_pending"]:
+                state["sell_pending"] = True
+                self._cancel_orders(symbol)
+
+                actual_qty = self._get_actual_position(symbol)
+                if actual_qty <= 0:
+                    print(f"⚠️  {symbol}: sell signal but no position — correcting state.")
+                    state["shares_held"]  = False
+                    state["sell_pending"] = False
+                    return
+
                 try:
-                    await asyncio.to_thread(self.client.submit_order, MarketOrderRequest(
-                        symbol=self.symbol, qty=self.primary_qty,
+                    self.client.submit_order(MarketOrderRequest(
+                        symbol=symbol, qty=actual_qty,
                         side=OrderSide.SELL, time_in_force=TimeInForce.DAY
                     ))
-                    self.shares_held = False
-                    print("✅ SELL order placed")
+                    state["shares_held"]  = False
+                    state["sell_pending"] = False
+                    state["qty"]          = BST_QTY   # reset for next cycle
+                    state["last_trade_time"] = now
+                    print(f"✅ TICK SELL {symbol} ({actual_qty} shares)")
                 except Exception as e:
-                    print(f"❌ SELL failed: {e}")
+                    state["sell_pending"] = False      # allow retry on next tick
+                    print(f"❌ TICK SELL {symbol} failed: {e}")
 
-            elif current_momentum < -0.05 and not self.shares_held:
-                print("waiting")
+            elif current_momentum < -0.10 and not state["shares_held"]:
+                print(f"{symbol}: waiting")
 
-    # ── helpers ───────────────────────────────────
-    def cancel_all_orders(self) -> None:
+    # ── helpers ───────────────────────────────────────────────────────────────
+
+    def _cancel_orders(self, symbol: str) -> None:
         try:
             orders = self.client.get_orders(GetOrdersRequest(
-                status=QueryOrderStatus.OPEN, symbols=[self.symbol]
+                status=QueryOrderStatus.OPEN, symbols=[symbol]
             ))
             for order in orders:
-                self.client.cancel_order_by_id(order.id)
-                print(f"🚫 Cancelled order {order.id}")
+                try:
+                    self.client.cancel_order_by_id(order.id)
+                    print(f"🚫 Cancelled order {order.id} ({symbol})")
+                except Exception as e:
+                    if "already" in str(e).lower() or "filled" in str(e).lower():
+                        pass  # order filled before cancel arrived — harmless
+                    else:
+                        print(f"Error cancelling order {order.id} ({symbol}): {e}")
         except Exception as e:
-            print(f"Error cancelling orders: {e}")
+            print(f"Error fetching orders for {symbol}: {e}")
 
     def get_avg_price_momentum(self, symbol: str, days: int = 5) -> float | None:
         end   = datetime.now(timezone.utc)
@@ -299,12 +412,14 @@ class Bot:
         diffs  = [closes[i] - closes[i - 1] for i in range(1, len(closes))]
         return sum(diffs[-actual:]) / actual
 
-    def update_avg_momentum(self) -> None:
-        self.avg_price_momentum   = self.get_avg_price_momentum(self.symbol, 5)
-        self.last_momentum_update = datetime.now(timezone.utc)
-
     def check_market_status(self) -> bool:
         return self.client.get_clock().is_open
+
+    def get_stream_symbols(self) -> list[str]:
+        """Return current top-3 symbols for stream subscription.
+        Falls back to [self.symbol] if BST is empty."""
+        top3 = [sym for sym, _ in self.momentum_bst.top_n(3)]
+        return top3 if top3 else [self.symbol]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -313,22 +428,24 @@ class Bot:
 
 def run_headless() -> None:
     """
-    One-shot execution: build the BST, execute BST trades, then subscribe
-    to the live AAPL stream and run until the market closes or the process
-    is killed by the scheduler.
+    One-shot execution: build the BST, execute BST trades, subscribe to live
+    streams for all top-3 symbols, and run tick-momentum trading on each.
     """
     bot = Bot(trading_client, data_client)
 
-    # Execute BST trades immediately on startup
     if bot.check_market_status():
         print("📡 Market open — executing BST trades now …")
         bot._execute_bst_trades()
     else:
         print("💤 Market closed — BST trades skipped.")
 
-    # Subscribe to live stream for tick-level momentum trading
-    stream.subscribe_trades(bot.on_trade_update, bot.symbol)
-    print(f"📡 Subscribed to {bot.symbol} trade stream. Running …")
+    # Subscribe to tick streams for all current top-3 symbols
+    top3_symbols = [sym for sym, _ in bot.momentum_bst.top_n(3)]
+    if not top3_symbols:
+        top3_symbols = [bot.symbol]   # fallback to AAPL if BST is empty
+
+    stream.subscribe_trades(bot.on_trade_update, *top3_symbols)
+    print(f"📡 Subscribed to tick streams: {top3_symbols}")
     stream.run()   # blocks until interrupted
 
 
